@@ -1,7 +1,7 @@
 # question-to-column
 
-Interactive table [widget](https://github.com/manzt/anywidget) where rows correspond to scientific papers (from a Zotero collection) and columns correspond to questions.
-Convert each question into a column using a [local lanaguage model](https://github.com/ollama/ollama).
+Create a table where rows correspond to scientific papers (from a Zotero collection) and columns correspond to questions.
+Parse each paper PDF and obtain the values for each column by asking a local lanaguage model.
 
 ```sh
 export ZOTERO_API_KEY='something' # TODO: make optional
