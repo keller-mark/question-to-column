@@ -6,12 +6,13 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
-    import anywidget
-    import numpy as np
-    import pandas as pd
     import os
     from os.path import join
+    from functools import cache
+    import numpy as np
+    import pandas as pd
     from oxc_py import transform
+    import anywidget
     from traitlets import Unicode, Dict, List, Int, Bool
     return (
         Bool,
@@ -20,6 +21,7 @@ def _():
         List,
         Unicode,
         anywidget,
+        cache,
         join,
         np,
         os,
@@ -35,18 +37,45 @@ def _():
 
 
 @app.cell
+def _():
+    # References:
+    # - https://docs.llamaindex.ai/en/stable/examples/llm/ollama/#structured-outputs
+    # - https://docs.llamaindex.ai/en/stable/examples/cookbooks/oreilly_course_cookbooks/Module-8/Advanced_RAG_with_LlamaParse/#llamaparse-pdf-reader-for-pdf-parsing
+    from llama_index.core import SimpleDirectoryReader
+    from llama_index.llms.ollama import Ollama
+    from llama_index.core.llms import ChatMessage
+    from llama_index.core.bridge.pydantic import BaseModel
+    from llama_parse import LlamaParse
+
+    # Required to use sync API of LlamaParse
+    import nest_asyncio
+    nest_asyncio.apply()
+    return (
+        BaseModel,
+        ChatMessage,
+        LlamaParse,
+        Ollama,
+        SimpleDirectoryReader,
+        nest_asyncio,
+    )
+
+
+@app.cell
 def _(join, os):
+    LLAMA_CLOUD_API_KEY = os.environ.get('LLAMA_CLOUD_API_KEY')
     ZOTERO_API_KEY = os.environ.get('ZOTERO_API_KEY')
     ZOTERO_PDF_DIR = join(os.environ['HOME'], 'Zotero', 'storage')
-
-    LLAMA_CLOUD_API_KEY = os.environ.get('LLAMA_CLOUD_API_KEY')
     return LLAMA_CLOUD_API_KEY, ZOTERO_API_KEY, ZOTERO_PDF_DIR
 
 
 @app.cell
-def _(ZOTERO_API_KEY, zotero):
+def _(LLAMA_CLOUD_API_KEY, LlamaParse, Ollama, ZOTERO_API_KEY, zotero):
     zot = zotero.Zotero(library_id='5416725', library_type='group', api_key=ZOTERO_API_KEY)
-    return (zot,)
+    llm = Ollama(model="llama3.1:latest", request_timeout=120.0)
+    parser = LlamaParse(result_type="markdown", api_key=LLAMA_CLOUD_API_KEY)
+    # TODO: if no llamacloud API key, fall back to using Pymupdf
+    # See https://github.com/keller-mark/sc-vis-scripts/blob/bd8a855e0f713f3557888b0bddc419bb0a0b7b9e/src/sc_star_scripts/alt_pdf_text_extraction.py#L7
+    return llm, parser, zot
 
 
 @app.cell
@@ -56,11 +85,11 @@ def _(ZOTERO_PDF_DIR, join, zot):
 
         papers = [ d for d in items if d["data"]["itemType"] == "journalArticle" ]
         attachments = [ d for d in items if d["data"]["itemType"] == "attachment" ]
-        
+
         def get_attachment(item):
             attachment_url = item["links"]["attachment"]["href"]
             attachment_key = attachment_url.split("/")[-1]
-            
+
             for a in attachments:
                 if a["key"] == attachment_key:
                     return a
@@ -75,7 +104,7 @@ def _(ZOTERO_PDF_DIR, join, zot):
                 "filename": attachment["data"]["filename"],
                 "filepath": join(ZOTERO_PDF_DIR, attachment["key"], attachment["data"]["filename"])
             }
-        
+
         papers_for_table = [
             get_paper(item)
             for item in papers
@@ -92,7 +121,115 @@ def _(get_papers_in_collection):
 
 
 @app.cell
-def _(Dict, List, anywidget, papers_for_table, transform):
+def _():
+    columns_for_table = [
+        {
+            'name': 'Abstract Summary',
+            'instructions': 'Please condense the abstract into a one-sentence summary.',
+            'answer_structure': None,
+        },
+        {
+            'name': 'Number of Cells',
+            'instructions': 'In total, how many cells were profiled in this study?',
+            'answer_structure': None,
+        }
+    ]
+    return (columns_for_table,)
+
+
+@app.cell
+def _(cache, parser):
+    @cache
+    def get_paper_markdown(filepath):
+        pages = parser.load_data(filepath)
+        result = ""
+        for page in pages:
+            result += (page.text + "\n")
+        return result
+    return (get_paper_markdown,)
+
+
+@app.cell
+def _(ChatMessage, llm):
+    def answer_question(instructions, paper_text, max_paper_len=10000):
+        paper_messages = [
+            ChatMessage(
+                role="system",
+                content="You are extracting information from a scientific document."
+            ),
+            # TODO: first embed each page or paper section, then embed the pages/sections and use a RAG approach?
+            # See https://ollama.com/blog/embedding-models
+            # TODO: find a model with a longer context length to be able to increase max_paper_len?
+            ChatMessage(
+                role="user",
+                content=f"{instructions}\n{paper_text[:max_paper_len]}"
+            ),
+            # TODO: obtain structured outputs using Pydantic
+            # See https://docs.llamaindex.ai/en/stable/examples/output_parsing/llm_program/
+        ]
+        paper_resp = llm.chat(paper_messages)
+        return str(paper_resp)
+    return (answer_question,)
+
+
+@app.cell
+def _(answer_question, get_paper_markdown, papers_for_table):
+    # Try out the answer_question function
+    paper_resp = answer_question(
+        "In total, how many cells were profiled in this study?",
+        get_paper_markdown(papers_for_table[0]["filepath"]),
+    )
+    paper_resp
+    return (paper_resp,)
+
+
+@app.cell
+def _(papers_for_table, pd):
+    df = pd.DataFrame(data=papers_for_table)
+    df
+    return (df,)
+
+
+@app.cell
+def _(answer_question, get_paper_markdown):
+    def answer_question_by_filepath(filepath, instructions):
+        paper_text = get_paper_markdown(filepath)
+        return answer_question(instructions, paper_text)
+    return (answer_question_by_filepath,)
+
+
+@app.cell
+def _(answer_question_by_filepath, columns_for_table, df):
+    for column_info in columns_for_table:
+        colname = column_info["name"]
+        instructions = column_info["instructions"]
+        df[colname] = df["filepath"].apply(lambda f: answer_question_by_filepath(f, instructions))
+    return colname, column_info, instructions
+
+
+@app.cell
+def _(df):
+    df.to_csv("test.csv")
+    return
+
+
+@app.cell
+def _(df):
+    df
+    return
+
+
+@app.cell
+def _(
+    Dict,
+    List,
+    anywidget,
+    columns_for_table,
+    papers_for_table,
+    transform,
+):
+    # TODO: make the table widget more interactive / sync column manager state with Python state
+
     class TableWidget(anywidget.AnyWidget):
         _esm = transform("""
         import * as React from "https://esm.sh/react@18";
@@ -157,99 +294,11 @@ def _(Dict, List, anywidget, papers_for_table, transform):
 
 
     table = TableWidget()
-    table.papers = papers_for_table
     # TODO: sync with input/textarea elements
-    table.columns = [
-        {
-            'name': 'Abstract Summary',
-            'instructions': 'Please condense the abstract into a one-sentence summary.',
-            'answer_structure': None,
-        },
-        {
-            'name': 'Number of Cells',
-            'instructions': 'In total, how many cells were profiled in this study?',
-            'answer_structure': None,
-        }
-    ]
+    table.papers = papers_for_table
+    table.columns = columns_for_table
     table
     return TableWidget, table
-
-
-@app.cell
-def _():
-    # References:
-    # - https://docs.llamaindex.ai/en/stable/examples/llm/ollama/#structured-outputs
-    # - https://docs.llamaindex.ai/en/stable/examples/cookbooks/oreilly_course_cookbooks/Module-8/Advanced_RAG_with_LlamaParse/#llamaparse-pdf-reader-for-pdf-parsing
-    from llama_index.core import SimpleDirectoryReader
-    from llama_index.llms.ollama import Ollama
-    from llama_index.core.llms import ChatMessage
-    from llama_index.core.bridge.pydantic import BaseModel
-    from llama_parse import LlamaParse
-    return BaseModel, ChatMessage, LlamaParse, Ollama, SimpleDirectoryReader
-
-
-@app.cell
-def _(Ollama):
-    llm = Ollama(model="llama3.1:latest", request_timeout=120.0)
-    return (llm,)
-
-
-@app.cell
-def _(ChatMessage, llm):
-    messages = [
-        ChatMessage(
-            role="system", content="You are a pirate with a colorful personality"
-        ),
-        ChatMessage(role="user", content="What is your name"),
-    ]
-    resp = llm.chat(messages)
-    return messages, resp
-
-
-@app.cell
-def _(resp):
-    print(resp)
-    return
-
-
-@app.cell
-def _(LLAMA_CLOUD_API_KEY, LlamaParse):
-    parser = LlamaParse(result_type="markdown", api_key=LLAMA_CLOUD_API_KEY)
-    # TODO: if no llamacloud API key, fall back to using Pymupdf
-    # See https://github.com/keller-mark/sc-vis-scripts/blob/bd8a855e0f713f3557888b0bddc419bb0a0b7b9e/src/sc_star_scripts/alt_pdf_text_extraction.py#L7
-    return (parser,)
-
-
-@app.cell
-async def _(papers_for_table, parser):
-    documents = await parser.aload_data(papers_for_table[0]["filepath"])
-    return (documents,)
-
-
-@app.cell
-def _(documents):
-    print(documents[1].text)
-    return
-
-
-@app.cell
-def _(ChatMessage, documents, llm):
-    paper_messages = [
-        ChatMessage(
-            role="system", content="You are extracting information from a scientific document."
-        ),
-        ChatMessage(role="user", content=f"In total, how many cells were profiled in this study?\n{documents[0].text}"),
-        # TODO: obtain structured outputs using Pydantic
-        # See https://docs.llamaindex.ai/en/stable/examples/output_parsing/llm_program/
-    ]
-    paper_resp = llm.chat(paper_messages)
-    return paper_messages, paper_resp
-
-
-@app.cell
-def _(paper_resp):
-    print(paper_resp)
-    return
 
 
 @app.cell
